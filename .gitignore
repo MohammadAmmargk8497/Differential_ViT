@@ -1,0 +1,3 @@
+imagenet-object-localization-challenge/
+checkpoints/
+*__pycache__
