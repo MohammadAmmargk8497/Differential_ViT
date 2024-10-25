@@ -8,16 +8,17 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from DiffAttention import MultiheadDiffAttn  # Ensure this is in your PYTHONPATH
+from DiffAttention import MultiheadDiffAttn  
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 from torch.utils.data import DataLoader, Subset, random_split
 from DataLoader import CustomImageDataset
 import numpy as np
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-# Import your VisionTransformer model
-# Replace 'your_model_file' with the actual filename without .py
-from ViT import VisionTransformer  # e.g., from vit_model import VisionTransformer
+
+from ViT import VisionTransformer  
 
 
 def parse_args():
@@ -29,8 +30,8 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=32,
                         help='Batch size for training')
     parser.add_argument('--learning-rate', type=float, default=3e-4,
-                        help='Initial learning rate') 
-    parser.add_argument('--weight-decay', type=float, default=1e-4, 
+                        help='Initial learning rate')
+    parser.add_argument('--weight-decay', type=float, default=1e-4,
                         help='Weight decay for optimizer')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of data loading workers')
@@ -84,14 +85,11 @@ def get_data_loaders(data_dir, image_size, batch_size, num_workers, selected_cla
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
     ])
-
     # Load the dataset and filter only the selected classes
     all_data = datasets.ImageFolder(os.path.join(data_dir, 'train'), transform=None)
     selected_class_indices = [all_data.class_to_idx[cls] for cls in selected_classes]
     filtered_samples = [sample for sample in all_data.samples if sample[1] in selected_class_indices]
-
-    # Shuffle and split the dataset
-    np.random.shuffle(filtered_samples)
+    # Existing dataset code...
     num_val = int(len(filtered_samples) * val_split)
     val_samples = filtered_samples[:num_val]
     train_samples = filtered_samples[num_val:]
@@ -100,13 +98,18 @@ def get_data_loaders(data_dir, image_size, batch_size, num_workers, selected_cla
     train_dataset = CustomImageDataset(train_samples, transform=transform_train)
     val_dataset = CustomImageDataset(val_samples, transform=transform_val)
 
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True)
+    # Create DistributedSampler
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
 
-    return train_loader, val_loader
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=True, sampler=train_sampler)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True, sampler=val_sampler)
+
+    return train_loader, val_loader, train_sampler, val_sampler
+
 
 def initialize_model(args):
     model = VisionTransformer(
@@ -123,16 +126,20 @@ def initialize_model(args):
     return model
 
 
-def train_one_epoch(model, criterion, optimizer, data_loader, device, scheduler=None, scaler=None):
+def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, rank, scheduler=None, scaler=None):
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
 
-    progress_bar = tqdm(data_loader, desc="Training", leave=False)
+    if rank == 0:
+        progress_bar = tqdm(data_loader, desc=f"Training Epoch {epoch+1}", leave=False)
+    else:
+        progress_bar = data_loader
+
     for inputs, targets in progress_bar:
-        inputs = inputs.to(device)
-        targets = targets.to(device)
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
 
         optimizer.zero_grad()
 
@@ -155,7 +162,8 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, scheduler=
         correct += predicted.eq(targets).sum().item()
         total += targets.size(0)
 
-        progress_bar.set_postfix({'Loss': f'{running_loss / total:.4f}', 'Acc': f'{100. * correct / total:.2f}%'})
+        if rank == 0:
+            progress_bar.set_postfix({'Loss': f'{running_loss / total:.4f}', 'Acc': f'{100. * correct / total:.2f}%'})
 
     epoch_loss = running_loss / total
     epoch_acc = 100. * correct / total
@@ -166,18 +174,22 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, scheduler=
     return epoch_loss, epoch_acc
 
 
-def validate(model, criterion, data_loader, device):
+def validate(model, criterion, data_loader, device, epoch, rank):
     torch.cuda.empty_cache()
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
 
+    if rank == 0:
+        progress_bar = tqdm(data_loader, desc=f"Validation Epoch {epoch+1}", leave=False)
+    else:
+        progress_bar = data_loader
+
     with torch.no_grad():
-        progress_bar = tqdm(data_loader, desc="Validation", leave=False)
         for inputs, targets in progress_bar:
-            inputs = inputs.to(device)
-            targets = targets.to(device)
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
 
             outputs = model(inputs)
             loss = criterion(outputs, targets)
@@ -189,7 +201,8 @@ def validate(model, criterion, data_loader, device):
             correct += predicted.eq(targets).sum().item()
             total += targets.size(0)
 
-            progress_bar.set_postfix({'Loss': f'{running_loss / total:.4f}', 'Acc': f'{100. * correct / total:.2f}%'})
+            if rank == 0:
+                progress_bar.set_postfix({'Loss': f'{running_loss / total:.4f}', 'Acc': f'{100. * correct / total:.2f}%'})
 
     epoch_loss = running_loss / total
     epoch_acc = 100. * correct / total
@@ -199,7 +212,8 @@ def validate(model, criterion, data_loader, device):
 
 def save_checkpoint(state, is_best, checkpoint_dir, filename='checkpoint.pth'):
     os.makedirs(checkpoint_dir, exist_ok=True)
-    # torch.save(state, os.path.join(checkpoint_dir, filename))
+    # Save checkpoint
+    torch.save(state, os.path.join(checkpoint_dir, filename))
     if is_best:
         torch.save(state, os.path.join(checkpoint_dir, 'best_model.pth'))
 
@@ -207,12 +221,21 @@ def save_checkpoint(state, is_best, checkpoint_dir, filename='checkpoint.pth'):
 def main():
     args = parse_args()
     selected_classes = ['n01440764', 'n01443537', 'n01484850', 'n01491361', 'n01494475']
-    # Device configuration
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Initialize the process group
+    dist.init_process_group(backend='nccl', init_method='env://')
+
+    # Get local rank and set device
+    local_rank = int(os.environ['LOCAL_RANK'])
+    torch.cuda.set_device(local_rank)
+    device = torch.device('cuda', local_rank)
     print(f"Using device: {device}")
 
+    # Get global rank
+    rank = dist.get_rank()
+
     # Prepare data loaders
-    train_loader, val_loader = get_data_loaders(
+    train_loader, val_loader, train_sampler, val_sampler = get_data_loaders(
         data_dir=args.data_dir,
         image_size=args.image_size,
         batch_size=args.batch_size,
@@ -224,8 +247,11 @@ def main():
     model = initialize_model(args)
     model = model.to(device)
 
+    # Wrap the model with DDP
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
     # Define loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # Learning rate scheduler (optional)
@@ -239,69 +265,81 @@ def main():
     best_acc = 0.0
     if args.resume:
         if os.path.isfile(args.resume):
-            print(f"Loading checkpoint '{args.resume}'")
-            checkpoint = torch.load(args.resume, map_location=device)
+            map_location = {'cuda:%d' % 0: 'cuda:%d' % local_rank}
+            checkpoint = torch.load(args.resume, map_location=map_location)
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
             best_acc = checkpoint.get('best_acc', 0.0)
-            print(f"Loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
+            if rank == 0:
+                print(f"Loaded checkpoint '{args.resume}' (epoch {checkpoint['epoch']})")
         else:
-            print(f"No checkpoint found at '{args.resume}'")
+            if rank == 0:
+                print(f"No checkpoint found at '{args.resume}'")
 
-    # Create output directory with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    output_dir = os.path.join(args.output_dir, timestamp)
-    os.makedirs(output_dir, exist_ok=True)
-
-    # Initialize TensorBoard writer (optional)
-    # Uncomment the following lines if you want to use TensorBoard for logging
-    # from torch.utils.tensorboard import SummaryWriter
-    # writer = SummaryWriter(log_dir=os.path.join(output_dir, 'logs'))
+    # Create output directory with timestamp (only on main process)
+    if rank == 0:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_dir = os.path.join(args.output_dir, timestamp)
+        os.makedirs(output_dir, exist_ok=True)
 
     # Training loop
     for epoch in range(start_epoch, args.epochs):
-        print(f"\nEpoch {epoch + 1}/{args.epochs}")
+        if rank == 0:
+            print(f"\nEpoch {epoch + 1}/{args.epochs}")
+
+        # Set epoch for sampler
+        train_sampler.set_epoch(epoch)
+        val_sampler.set_epoch(epoch)
 
         train_loss, train_acc = train_one_epoch(
-            model, criterion, optimizer, train_loader, device,
+            model, criterion, optimizer, train_loader, device, epoch, rank,
             scheduler=scheduler, scaler=scaler
         )
 
-        val_loss, val_acc = validate(model, criterion, val_loader, device)
+        val_loss, val_acc = validate(model, criterion, val_loader, device, epoch, rank)
 
-        print(f"Training   - Loss: {train_loss:.4f}, Acc: {train_acc:.2f}%")
-        print(f"Validation - Loss: {val_loss:.4f}, Acc: {val_acc:.2f}%")
+        # Reduce metrics across processes
+        total_train_loss = torch.tensor(train_loss).to(device)
+        total_train_acc = torch.tensor(train_acc).to(device)
+        total_val_loss = torch.tensor(val_loss).to(device)
+        total_val_acc = torch.tensor(val_acc).to(device)
 
-        # Optionally log to TensorBoard
-        # writer.add_scalar('Loss/train', train_loss, epoch)
-        # writer.add_scalar('Accuracy/train', train_acc, epoch)
-        # writer.add_scalar('Loss/val', val_loss, epoch)
-        # writer.add_scalar('Accuracy/val', val_acc, epoch)
+        dist.reduce(total_train_loss, dst=0, op=dist.ReduceOp.SUM)
+        dist.reduce(total_train_acc, dst=0, op=dist.ReduceOp.SUM)
+        dist.reduce(total_val_loss, dst=0, op=dist.ReduceOp.SUM)
+        dist.reduce(total_val_acc, dst=0, op=dist.ReduceOp.SUM)
 
-        # Check if this is the best model so far
-        is_best = val_acc > best_acc
-        best_acc = max(val_acc, best_acc)
+        if rank == 0:
+            total_train_loss /= dist.get_world_size()
+            total_train_acc /= dist.get_world_size()
+            total_val_loss /= dist.get_world_size()
+            total_val_acc /= dist.get_world_size()
 
-        # Save checkpoint
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'best_acc': best_acc,
-        }
-        save_checkpoint(checkpoint, is_best, checkpoint_dir=output_dir, filename=f'epoch_{epoch + 1}.pth')
+            print(f"Training   - Loss: {total_train_loss:.4f}, Acc: {total_train_acc:.2f}%")
+            print(f"Validation - Loss: {total_val_loss:.4f}, Acc: {total_val_acc:.2f}%")
 
-        if is_best:
-            print(f"New best model with accuracy: {best_acc:.2f}%. Saved to '{output_dir}/best_model.pth'")
+            # Check if this is the best model so far
+            is_best = total_val_acc > best_acc
+            best_acc = max(total_val_acc, best_acc)
 
-    # Close TensorBoard writer if used
-    # writer.close()
+            # Save checkpoint
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.module.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_acc': best_acc,
+            }
+            save_checkpoint(checkpoint, is_best, checkpoint_dir=output_dir, filename=f'epoch_{epoch + 1}.pth')
 
-    print(f"\nTraining complete. Best validation accuracy: {best_acc:.2f}%")
-    print(f"Checkpoints are saved in '{output_dir}'")
+            if is_best:
+                print(f"New best model with accuracy: {best_acc:.2f}%. Saved to '{output_dir}/best_model.pth'")
+
+    if rank == 0:
+        print(f"\nTraining complete. Best validation accuracy: {best_acc:.2f}%")
+        print(f"Checkpoints are saved in '{output_dir}'")
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ except ModuleNotFoundError:
     print("No fused RMSNorm")
     from torch.nn import LayerNorm as RMSNorm
 from torch.autograd import gradcheck
+from torchinfo import summary
 
 #Embedding creation
 class PatchEmbedding(nn.Module):
@@ -159,14 +160,14 @@ if __name__ == '__main__':
         depth=12,
         num_heads=12,
         mlp_dim=3072,
-        channels=1,
+        channels=3,
         dropout=0.1,
     )
     
     model.to(device)
     # Create a random input tensor (batch_size, channels, height, width)
     
-    x = torch.randn(1, 1, 224, 224).to(device)
+    x = torch.randn(1, 3, 224, 224).to(device)
     logits = model(x)
     target = torch.randn(1, 1000).to(device)
     
@@ -183,6 +184,7 @@ if __name__ == '__main__':
     # Gradients with respect to the input tensor
     print("Gradients of the input tensor:")
     print(x.grad)
+    summary(model, input_size=(1, 3, 224, 224))
 
     # # Gradients with respect to the model's parameters
     # print("\nGradients of the model's parameters:")
