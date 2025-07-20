@@ -143,7 +143,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, ran
 
         optimizer.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=scaler is not None):
+        with torch.amp.autocast("cuda", enabled=scaler is not None):
             outputs = model(inputs)
             loss = criterion(outputs, targets)
 
