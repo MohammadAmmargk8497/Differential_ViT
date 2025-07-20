@@ -38,9 +38,9 @@ This leads to a more efficient, focused, and powerful attention mechanism that l
 
 -   `DiffAttention.py`: Contains the core implementation of the `MultiheadDiffAttn` module. This is the heart of the novel mechanism.
 -   `ViT.py`: Defines the `VisionTransformer` architecture, integrating `MultiheadDiffAttn` into the encoder blocks.
--   `DataLoader.py`: A utility for loading image datasets.
--   `ViT_train.py`: A script for training the model on a single GPU.
--   `ViT_Train_Dist.py`: A script for distributed training across multiple GPUs.
+-   `DataLoader.py`: Utility for loading image datasets.
+-   `ViT_train.py`: Script for training the model on a single GPU.
+-   `ViT_Train_Dist.py`: Script for distributed training across multiple GPUs.
 
 ## How to Use
 
@@ -65,6 +65,7 @@ python ViT_train.py \
 ```
 ## To DO:
 Due to lack of computational resources we are not able to train the model. Pretraining on ImageNet is needed before fine tuning it. 
+Use CKA to analyse and compare the internal representations of Diff_ViT and Vanilla ViT.
 ## Citation
 
 This work is an implementation based on the concepts from the following paper. Please consider citing it if you find this repository useful.
